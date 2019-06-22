@@ -1,0 +1,1579 @@
+#!/usr/bin/perl -w
+######################################################################
+# Author: Carlos Puchol <cpg at amahi dot org>
+# This code is (C) 2013, Amahi
+# It's licensed under the GNU AGPL V3 License
+######################################################################
+
+# NOTE: You can change default settings by creating /etc/hda-ctl.conf
+# and putting perl variable assignments there, like for example:
+#
+# $DEVICE = "eth0";
+# $NETMASK_SIZE = "24";
+# $NET_START = "0";
+# $DYN_LO = "100";
+# $DYN_HI = "254";
+# $DHCP_LEASE = "14400";
+# $use_opendns_secondary = 0;
+# $use_dnsmasq_dns = 0;
+# $use_dnsmasq_dhcp = 0;
+# $dnsmasq_resolve_catch_all = 0;
+#
+# the file is interpreted as perl, so do not break it!
+# note that if these settings are in the database, those always take priority when the program starts
+
+use strict;
+use DBI();
+use Getopt::Std;
+use LWP::Simple;
+use LWP::Protocol::https;
+use URI::Escape;
+use POSIX qw(strftime);
+use POSIX qw(mkfifo);
+use IO::Handle;
+use IO::File;
+use Socket;
+use Regexp::Common qw /net/;
+
+################  dnsmasq settings   ##################
+# Enable dnsmasq for DNS resolution and DHCP:
+our $use_dnsmasq_dns = 1;
+our $use_dnsmasq_dhcp = 1;
+#########  enabling ISC's bind and dhcpd ############
+# to enable this code to control named:
+#
+#    set $use_dnsmasq_dns to 0 above
+#
+# to enable this code to control the ISC dhcp:
+#
+#    set $use_dnsmasq_dhcpd to 0 above
+#
+# using one only one of them may or may not work.
+# it's not recommended.
+#
+#######################################################
+
+#######################################################
+# DNSMASQ settings:
+# To resolve everything (including non-existing names) in the DNS
+# for your Amahi domain, set to 1
+our $dnsmasq_resolve_catch_all = 0;
+
+our ($DEVICE, $NETMASK_SIZE, $NET_START, $DYN_LO, $DYN_HI, $USE_OPENDNS_SECONDARY, $DHCP_LEASE);
+
+my $conf_file = "/etc/hda-ctl.conf";
+my $return = '';
+if (-e $conf_file) {
+	unless ($return = do $conf_file) {
+		warn "hda-ctl: couldn't parse settings in $conf_file: $@" if $@;
+		warn "hda-ctl: couldn't read settings in $conf_file: $!" unless defined $return;
+		warn "hda-ctl: couldn't run settings in $conf_file: $@ - $!" unless $return;
+	}
+}
+
+# pick up the default route device
+my $default_dev = `ip route | awk '/^default/ { printf \$5 }'`;
+
+my $device = $DEVICE || $default_dev || "eth0";
+
+# To enable DNS resolution secondary via OpenDNS,
+# set the line below to 1
+my $use_opendns_secondary = 0;
+
+
+# change defaults here, though, if they are are in the database as settings, those always take priority
+my $default_netmask_size = $NETMASK_SIZE || "24";
+my $default_net_start = $NET_START || "0";
+my $default_dyn_lo = $DYN_LO || "100";
+my $default_dyn_hi = $DYN_HI || "254";
+my $default_dhcp_lease = $DHCP_LEASE || "14400";
+
+my $version = "11.0.0";
+
+my $DATABASE_NAME = "hda_production";
+my $DATABASE_USER = "amahihda";
+my $DATABASE_PASSWORD = "AmahiHDARulez";
+
+# flag to branch on using dnsmasq
+my $dnsmasq_in_use = $use_dnsmasq_dns || $use_dnsmasq_dhcp;
+
+our($opt_d, $opt_h);
+getopts('dh');
+
+my $pidfile = "/var/run/hda-ctl.pid";
+my $period = 600; # run period, in seconds
+my $cmdfile = "/var/run/hda-ctl/notify";
+
+my $platform = "unknown";
+my $named_user;
+my $named_service;
+my $named_dir;
+my $network_service;
+my $dhcp_service;
+
+## process args
+my $programd  = $0;
+$programd =~ s%^.*/%%;
+my $program   = $programd;
+$program  =~ s/d$//;
+my $now = time;
+
+my $caught_hup  = 0;
+my $caught_term = 0;
+my $caught_usr1 = 0;
+$SIG{'HUP'}    = sub { $caught_hup  = 1; };
+$SIG{'TERM'}   = sub { $caught_term = 1; };
+$SIG{'USR1'}   = sub { $caught_usr1 = 1; };
+
+my $CMDFIFO;
+
+# global database handle for both functions below
+my $dbh;
+my %settings;
+my @host = ();
+my %named_options;
+
+my $file_named = "named.conf";
+my $file_n2a = "hda-n2a";
+my $file_a2n = "hda-a2n";
+my $file_hda = "hda-void"; # "void" file
+my $file_dhcpd = "dhcpd.conf";
+my $file_resolv = "resolv.conf";
+my $file_ifcfg = "ifcfg-$device";
+my $file_dnsmasq_common = "amahi-common.conf";
+my $file_dnsmasq_dns = "amahi-dns.conf";
+my $file_dnsmasq_dhcp = "amahi-dhcp.conf";
+my $file_dnsmasq_ipv6 = "amahi-ipv6.conf";
+
+my $ifcfg_idx = 1;
+my $dump_mode = 0;
+
+# reverse ip address
+sub reverse_net {
+	return (join (".", reverse (split(/\./, shift)))) . ".in-addr.arpa";
+}
+
+sub pipecmd {
+	my $cmd   = shift;
+	my $stdin = join("\n", @_);
+	my $ok    = 0;
+
+	# remove trailing newlines
+	1 while chomp($stdin);
+
+	# override when debugging.
+	$cmd = "| $cmd";
+
+	# execute the command.
+	local *FD;
+	if (! open(FD, $cmd)) {
+		printf STDERR "$program: cannot execute command %s.\n", $cmd;
+	} elsif ($stdin && (! print FD "$stdin\n")) {
+		printf STDERR "$program: failed writting to %s.\n", $cmd;
+		close(FD);
+	} elsif (! close(FD)) {
+		# printf STDERR "$program: failed closing %s.($@)\n", $cmd;
+	} elsif ($?) {
+		printf STDERR "$program: failed %s. ($@)\n", $cmd;
+	} else {
+		$ok = 1;
+	}
+	return $ok;
+}
+
+sub log {
+	my $facility = "daemon";
+	my $priority = "notice";
+
+	return pipecmd("logger -p$facility.$priority -t${program}\[$$\]", @_);
+}
+
+sub logdie {
+	my $arg = shift;
+	my $facility = "daemon";
+	my $priority = "notice";
+
+	return pipecmd("logger -p$facility.$priority -t${program}\[$arg - exiting\]", @_);
+	exit -1;
+}
+
+sub get_named_settings {
+	open(my $named, "<", "/etc/sysconfig/named") or return;
+
+	while (<$named>) {
+		next if /^\s*#/; # skip options
+		if (/(\w+)\s*=\s*"?(.+?)"?\s*$/) {
+			my $name = $1;
+			my $value = $2;
+			chomp $value;
+			$named_options {$name} = $value;
+		}
+	}
+
+	close ($named);
+}
+
+sub check_db_sanity {
+
+	return 0 unless $dbh;
+
+	my $sth = $dbh->prepare("SELECT value FROM settings WHERE name = 'api-key'");
+	$sth->execute();
+
+	my @row = ();
+	@row = $sth->fetchrow_array;
+	my $value = $row[0];
+	$sth->finish();
+
+	return 1 if (length($value) == 40);
+	return 0;
+}
+
+sub get_db_settings {
+
+	my $sth = $dbh->prepare("SELECT name, value FROM settings");
+	$sth->execute();
+
+	my @row = ();
+	while (@row = $sth->fetchrow_array) {
+		my $name = $row[0];
+		my $value = $row[1];
+		$settings {$name} = $value;
+	}
+	$sth->finish();
+
+	# set defaults for new network stuff
+	$settings{'netmask_size'} = $settings{'netmask_size'} || $default_netmask_size;
+	$settings{'net_start'} = $settings{'net_start'} || $default_net_start;
+	$settings{'dyn_lo'} = $settings{'dyn_lo'} || $default_dyn_lo;
+	$settings{'dyn_hi'} = $settings{'dyn_hi'} || $default_dyn_hi;
+	$settings{'dhcp_lease_time'} = $settings{'lease_time'} || $settings{'dhcp_lease_time'} || $default_dhcp_lease;
+}
+
+sub db_connect {
+
+	# wait forever until the DB is up
+	while (1) {
+                $dbh = DBI->connect("DBI:mysql:database=$DATABASE_NAME;host=localhost",
+                                $DATABASE_USER, $DATABASE_PASSWORD);
+		if ($dbh && &check_db_sanity()) {
+			return;
+		}
+		sleep(60);
+	}
+}
+
+sub db_disconnect {
+	$dbh->disconnect();
+}
+
+sub resolve_dns_ips {
+	unless (defined($settings{'dns'})) {
+		# big ol' default for dns
+		return ("1.1.1.1", "1.0.0.1");
+	}
+	my $service = $settings{'dns'};
+	if ($settings{'dns'} eq 'opendns') {
+		return ("208.67.222.222", "208.67.220.220");
+	}
+	if ($settings{'dns'} eq 'google') {
+		return ("8.8.8.8", "8.8.4.4");
+	}
+	if ($settings{'dns'} eq 'cloudflare') {
+		return ("1.1.1.1", "1.0.0.1");
+	}
+	my $extdns1 = "8.8.8.8"; # 2nd default
+	my $extdns2 = "8.8.4.4"; # 2nd default
+	$extdns1 = $settings{'dns_ip_1'} if (defined($settings{'dns_ip_1'}));
+	$extdns2 = $settings{'dns_ip_2'} if (defined($settings{'dns_ip_2'}));
+	return ($extdns1, $extdns2);
+}
+
+sub print_named_conf {
+
+	open(my $hda, ">", $file_named);
+
+	my $domain = $settings{'domain'};
+	my $net = $settings{'net'};
+	my $reverse_net = &reverse_net($settings{'net'});
+	my $full_net = $net . "." . $settings{'net_start'};
+	my $netmask_size = $settings{'netmask_size'};
+	my $gw = $net . "." . $settings{'gateway'};
+	my $self = $net . "." . $settings{'self-address'};
+	my $dns1 = $self;
+	my $dyn_lo = $net . "." . $settings{'dyn_lo'};
+	my $dyn_hi = $net . "." . $settings{'dyn_hi'};
+	my ($extdns1, $extdns2) = &resolve_dns_ips();
+
+	printf $hda "# WARNING: Automatically generated by hda-ctl on " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n";
+	printf $hda "#          use %s for defaults and customizations of your own, or if\n", $conf_file;
+	printf $hda "#          /etc/named.conf.local exists, it will be automatically included at the bottom\n";
+	printf $hda "options {\n";
+	printf $hda "\tlisten-on-v6 port 53 { ::1; };\n";
+	printf $hda "\tdirectory \"/var/named\";\n";
+	printf $hda "\tdump-file \"/var/named/data/cache_dump.db\";\n";
+	printf $hda "\tstatistics-file \"/var/named/data/named_stats.txt\";\n";
+	printf $hda "\tmemstatistics-file \"/var/named/data/named_mem_stats.txt\";\n";
+	printf $hda "\tforward only;\n";
+	printf $hda "\tforwarders { %s; %s; };\n", $extdns1, $extdns2;
+	printf $hda "\tlisten-on port 53 { %s; 127.0.0.1; };\n", $self;
+	printf $hda "\tallow-query { trusted; };\n";
+	printf $hda "};\n";
+
+	printf $hda "acl \"trusted\" {\n";
+	printf $hda "\tlocalhost;\n";
+	printf $hda "\t10.8.0.0/16;\n";
+	printf $hda "\t%s/%s;\n", $full_net, $netmask_size;
+	printf $hda "};\n";
+
+	printf $hda "logging {\n";
+	printf $hda "\tchannel default_debug {\n";
+	printf $hda "\t\tfile \"data/named.run\";\n";
+	printf $hda "\t\tseverity dynamic;\n";
+	printf $hda "\t};\n";
+	printf $hda "};\n";
+
+        printf $hda "key \"ddnskey\" {\n";
+        printf $hda "\talgorithm hmac-md5;\n";
+        printf $hda "\tsecret \"%s\";\n", "8zaPJsiw9tOh2JFv4xiArw==";
+        printf $hda "};\n\n";
+
+        printf $hda "view \"internal\" {\n";
+        printf $hda "	match-clients		{ trusted; };\n";
+        printf $hda "	match-destinations	{ trusted; };\n\n";
+
+
+	printf $hda "zone \"%s\" IN {\n", $domain;
+        printf $hda "\ttype master;\n";
+        printf $hda "\tnotify no;\n";
+        printf $hda "\tfile \"dynamic/%s\";\n", $file_n2a;
+        printf $hda "\tallow-update { key ddnskey; };\n";
+        printf $hda "\tcheck-names ignore;\n";
+	printf $hda "};\n\n";
+
+	# FIXME: this needs to be derived from the $net!!
+	printf $hda "zone \"%s\" IN {\n", &reverse_net($net);
+       	printf $hda "\ttype master;\n";
+       	printf $hda "\tnotify no;\n";
+       	printf $hda "\tfile \"dynamic/%s\";\n", $file_a2n;
+        printf $hda "\tallow-update { key ddnskey; };\n";
+        printf $hda "\tcheck-names ignore;\n";
+	printf $hda "};\n\n";
+
+	printf $hda "\n";
+        if (-e '/etc/named.conf.local') {
+		printf $hda "include \"/etc/named.conf.local\";\n";
+        }
+	printf $hda "};\n\n";
+
+	my ($l, $p, $uid, $gid) = getpwnam($named_user);
+	chown $uid, $gid, $file_named;
+	my $prefix = $named_options{'ROOTDIR'} || "";
+	&mv ($file_named, $prefix . $named_dir);
+}
+
+sub print_void_info {
+	my $domain = shift;
+	my $void_host = shift;
+
+	open(my $void, ">", $file_hda);
+
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = gmtime();
+	$year -= 100;
+	$year = 10 if $year < 10; # needed e.g. if the system has a bad clock
+	my $serial = sprintf("%02d%02d%02d%02d%02d%02d", $year, $mon, $mday, $hour, $min, $sec);
+
+	printf $void "\$TTL    86400\n";
+	printf $void "@ IN SOA hda.%s. root.%s. (\n", $domain, $domain;
+        printf $void "\t%s ; Serial\n", $serial;
+        printf $void "\t28800   ; Refresh\n";
+        printf $void "\t14400   ; Retry\n";
+        printf $void "\t3600000 ; Expire\n";
+        printf $void "\t86400 ) ; Minimum\n";
+	printf $void "\t\tIN NS hda.%s.\n", $void_host;
+	printf $void "\t\tIN A %s\n", $void_host;
+	printf $void "*\tIN A %s\n", $void_host;
+	printf $void "\n";
+
+	close $void;
+}
+
+sub fill_hosts_table {
+
+	my $first_addr = shift;
+	my $last_addr = shift;
+
+	foreach my $i ($first_addr .. $last_addr) {
+		$host[$i] = sprintf ("h%03d", $i);
+	}
+
+	my $sth = $dbh->prepare("SELECT Name, Address FROM hosts");
+	$sth->execute();
+
+	my @row = ();
+	while (@row = $sth->fetchrow_array) {
+		my $name = $row[0];
+		my $address = int($row[1]);
+		if ($address > 0 && $address < 255) {
+			$host[$address] = $name;
+		}
+	}
+
+	# Hard-code the hostname for the HDA to 'hda'
+	$host[int($settings{'self-address'})] = "hda";
+
+	$sth->finish();
+}
+
+sub print_aliases {
+	my $name2addr = shift;
+
+
+	my $sth = $dbh->prepare("SELECT name, address FROM dns_aliases");
+	$sth->execute();
+
+	my @row = ();
+	while (@row = $sth->fetchrow_array) {
+		my $alias = $row[0];
+		# address can be of three forms:
+		# '' -> the alias maps to the self-address ip
+		# '<int>' -> the alias maps to the 1-255 address
+		# 'some.full.ip.address' -> the alias maps to that address
+		my $address = $row[1];
+		# if empty, point to the self-address host
+		if ($address =~ /^\s*$/) {
+			my $default_alias_ip = $settings{'net'} . "." . $settings{'self-address'};
+			printf $name2addr "%s\t\tA\t%s\n", $alias, $default_alias_ip;
+		} else {
+			# if it has just an bunch of digits check if it's a simple ip
+			if ($address =~ /^\s*\d+\s*$/) {
+				my $ip = int($address);
+				if (($ip > 0) && ($ip < 255)) {
+					my $full_ip = $settings{'net'} . "." . $ip;
+					printf $name2addr "%s\t\tA\t%s\n", $alias, $full_ip;
+				} else {
+					&log ("skipping alias '$alias' for address '$address' (too large)")
+				}
+			} else {
+				# else check if it's in the form
+				# of an address
+				if ($address =~ /^\s*\d+\.\d+\.\d+\.\d+\s*$/) {
+					# FIXME: this should have some more checking.
+					printf $name2addr "%s\t\tA\t%s\n", $alias, $address;
+				} else {
+					# else assume is a cname
+					&log ("skipping alias '$alias' for address '$address' (the latter does not parse as an ip address)");
+					# FIXME - this has the potential to generate
+					# bad config files. so it's disabled.
+					# printf $name2addr "%s\t\tCNAME\t%s\n", $alias, $address;
+				}
+			}
+		}
+	}
+	$sth->finish();
+}
+
+sub print_n2a_info {
+	my $serial = shift;
+	my $first_addr = shift;
+	my $last_addr = shift;
+
+	open(my $name2addr, ">", $file_n2a);
+
+	my $domain = $settings{'domain'};
+	my $net = $settings{'net'};
+
+	printf $name2addr "\$TTL    86400\n";
+	printf $name2addr "@ IN SOA hda.%s. root.%s. (\n", $domain, $domain;
+        printf $name2addr "\t%s ; Serial\n", $serial;
+        printf $name2addr "\t28800   ; Refresh\n";
+        printf $name2addr "\t14400   ; Retry\n";
+        printf $name2addr "\t3600000 ; Expire\n";
+        printf $name2addr "\t86400 ) ; Minimum\n";
+	printf $name2addr "\t\tIN NS hda.%s.\n", $domain;
+	printf $name2addr "\t\tIN MX 10 hda.%s.\n", $domain;
+	printf $name2addr "*\tIN MX 10 hda.%s.\n", $domain;
+	printf $name2addr "\n";
+
+	foreach my $i ($first_addr .. $last_addr) {
+		printf $name2addr "%s\t\tA\t%s.%d\n",
+			$host[$i], $net, $i;
+	}
+
+	&print_aliases ($name2addr);
+
+	close $name2addr;
+}
+
+sub print_a2n_info {
+	my $serial = shift;
+	my $first_addr = shift;
+	my $last_addr = shift;
+
+	open(my $addr2name, ">", $file_a2n);
+
+	my $domain = $settings{'domain'};
+	my $net = $settings{'net'};
+
+	printf $addr2name "\$TTL    86400\n";
+	printf $addr2name "@ IN SOA hda.%s. root.%s. (\n", $domain, $domain;
+        printf $addr2name "\t%s ; Serial\n", $serial;
+        printf $addr2name "\t28800   ; Refresh\n";
+        printf $addr2name "\t14400   ; Retry\n";
+        printf $addr2name "\t3600000 ; Expire\n";
+        printf $addr2name "\t86400 ) ; Minimum\n";
+	printf $addr2name "\t\tIN NS hda.%s.\n", $domain;
+	printf $addr2name "\t\tIN MX 10 hda.%s.\n", $domain;
+	printf $addr2name "*\tIN MX 10 hda.%s.\n", $domain;
+	printf $addr2name "\n";
+
+	foreach my $i ($first_addr .. $last_addr) {
+		printf $addr2name "%d\tPTR\t%s.%s.\n",
+			$i, $host[$i], $domain;
+	}
+
+	close $addr2name;
+}
+
+sub print_zone_files {
+
+	my $domain = $settings{'domain'};
+	my $net = $settings{'net'};
+	my $rev_net = &reverse_net($net);
+	my $void_host = $net . "." . $settings{'self-address'};
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = gmtime();
+	$year -= 100;
+	$year = 10 if $year < 10; # needed e.g. if the system has a bad clock
+	my $serial = sprintf("%02d%02d%02d%02d%02d%02d", $year, $mon, $mday, $hour, $min, $sec);
+
+	my $first_addr = $settings{'net_start'} + 1;
+	my $last_addr = $first_addr + 2 ** (32 - $settings{'netmask_size'}) - 3;
+
+	my $freeze1 = sprintf("rndc freeze %s", $domain);
+	my $freeze2 = sprintf("rndc freeze %s", $rev_net);
+	my $thaw1 = sprintf("rndc thaw %s", $domain);
+	my $thaw2 = sprintf("rndc thaw %s", $rev_net);
+
+	# freeze the zone
+	unless ($dump_mode) {
+		&freeze_or_thaw("freeze", $domain);
+		&freeze_or_thaw("freeze", $rev_net);
+        }
+
+	&fill_hosts_table($first_addr, $last_addr);
+	&print_n2a_info ($serial, $first_addr, $last_addr);
+	&print_a2n_info ($serial, $first_addr, $last_addr);
+	&print_void_info ($domain, $void_host);
+
+	my ($l, $p, $uid, $gid) = getpwnam($named_user);
+	chown $uid, $gid, $file_hda, $file_n2a, $file_a2n;
+	my $prefix = $named_options{'ROOTDIR'} || "";
+	&mv ($file_hda, $prefix . "/var/named");
+	&mv ($file_n2a, $prefix . "/var/named/dynamic");
+	&mv ($file_a2n, $prefix . "/var/named/dynamic");
+
+	# thaw
+        unless ($dump_mode) {
+		&freeze_or_thaw("thaw", $rev_net);
+		&freeze_or_thaw("thaw", $domain);
+        }
+}
+
+# freeze or thaw
+sub freeze_or_thaw {
+	my $operation = shift;
+	my $domain = shift;
+	my $freeze = sprintf("rndc %s %s", $operation, $domain);
+
+        if (system($freeze)) {
+		&log("warning: failed to run " . $freeze);
+	}
+}
+
+sub mv {
+	my $from = shift;
+	my $to = shift;
+
+	if ($dump_mode) {
+		printf ("file " . $from . " would be going to " . $to . "/\n");
+		return;
+	}
+
+	# &log ("moving " . $from . " to " . $to . "/\n");
+	system ("mv " . $from . " " . $to . "/");
+}
+
+sub print_one_host {
+	my $file = shift;
+	my $host = shift;
+	my $mac = shift;
+	my $address = shift;
+	my $domain = shift;
+
+	print $file "host $host {\n" .
+              "\thardware ethernet $mac;\n" .
+              "\tfixed-address $host.$domain;\n" .
+	      "\toption host-name \"$host\";\n" .
+              "}\n";
+}
+
+sub print_dhcp_conf_hosts {
+	my $file = shift;
+
+	my $sth = $dbh->prepare("SELECT Name, MAC, Address FROM hosts order by Name");
+	$sth->execute();
+
+	my @row = ();
+	while ( @row = $sth->fetchrow_array ) {
+		&print_one_host ($file, $row[0], $row[1], $row[2], $settings {'domain'});
+	}
+	$sth->finish();
+}
+
+
+# print_fedora_network and print_debian_network may be merged one day?
+sub print_fedora_network {
+
+	my $netmask = $settings{'netmask'};
+	my $self = $settings{'self-address'};
+	my $domain = $settings{'domain'};
+	my $net = $settings{'net'};
+	my $gw = $settings{'gateway'};
+	my ($dns1, $dns2) = &resolve_dns_ips();
+
+	my $prefix = "/etc/sysconfig/network-scripts";
+	my $ifcfg = "$prefix/$file_ifcfg";
+
+	my $temp_fh = IO::File->new_tmpfile or &logdie("cannot open a temporary file: $!");
+	open (my $IFCFG, "< $ifcfg") or &logdie("cannot open '$ifcfg' for reading: $!");
+	while (<$IFCFG>) {
+		next if /IPADDR|NETMASK|GATEWAY|DNS1|DNS2|SEARCH|DOMAIN|BOOTPROTO|NM_CONTROLLED|ONBOOT/;
+		next if /generated by hda-ctl/;
+		$temp_fh->syswrite($_);
+	}
+	close $IFCFG;
+
+	my $ifcfg_fh=IO::File->new("> $ifcfg") or &logdie("cannot open file $ifcfg: $!");
+
+	# Write out the new file from the temporary file handle
+	$temp_fh->sysseek(0, 0);
+	my $data = '';
+	my $header = "# generated by hda-ctl on " . strftime("%Y-%m-%d %H:%M:%S", localtime) . " / " . $ifcfg_idx++;
+	$ifcfg_fh->syswrite($data) while $temp_fh->sysread($data, 1024);
+	$ifcfg_fh->syswrite("IPADDR=$net.$self\nNETMASK=$netmask\nGATEWAY=$net.$gw\nDNS1=$net.$self\nDNS2=$net.$self\n");
+	$ifcfg_fh->syswrite("SEARCH=$domain\nDOMAIN=$domain\nBOOTPROTO=none\nNM_CONTROLLED=no\nONBOOT=yes\n$header\n");
+	$ifcfg_fh->close;
+	$temp_fh->close;
+
+	# move the old one out of the way - confuses some scripts
+	# and the network configuration program!
+	#system("mv $ifcfg$suffix /tmp");
+	system("rm /etc/sysconfig/networking/devices/$file_ifcfg /etc/sysconfig/networking/profiles/default/$file_ifcfg");
+	system("ln $prefix/$file_ifcfg /etc/sysconfig/networking/devices/$file_ifcfg");
+	system("ln $prefix/$file_ifcfg /etc/sysconfig/networking/profiles/default/$file_ifcfg");
+}
+
+sub print_resolver {
+
+	my $self = $settings{'self-address'};
+	my $domain = $settings{'domain'};
+	my $net = $settings{'net'};
+	my $rslv = "/etc/resolv.conf";
+
+	open (my $RSLV, "> $rslv") or &logdie("cannot open '$rslv' for writing: $!");
+	printf $RSLV "# Automatically generated by hda-ctl on " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n";
+	printf $RSLV "search $domain\n";
+	printf $RSLV "nameserver $net.$self\n";
+	printf $RSLV "nameserver $net.$self\n";
+	close $RSLV;
+
+	# ensure it's readable!
+	chmod 0644, $rslv;
+}
+
+sub print_debian_network {
+
+	my $netmask = $settings{'netmask'};
+	my $self = $settings{'self-address'};
+	my $domain = $settings{'domain'};
+	my $net = $settings{'net'};
+	my $gw = $settings{'gateway'};
+	my ($dns1, $dns2) = &resolve_dns_ips();
+
+        my $ifcfg = "/etc/network/interfaces";
+
+	my $ifcfg_fh=IO::File->new("> $ifcfg") or &logdie("cannot open file $ifcfg: $!");
+	$ifcfg_fh->sysseek(0, 0);
+
+	my $header = "# Generated by hda-ctl on " . strftime("%Y-%m-%d %H:%M:%S", localtime) . " / " . $ifcfg_idx++;
+        $ifcfg_fh->syswrite("$header\n" .
+                            "auto lo $device\n\n" .
+                            "iface lo inet loopback\n\n" .
+                            "iface $device inet static\n" .
+                            "     address $net.$self\n" .
+                            "     netmask $netmask\n" .
+                            "     gateway $net.$gw\n" .
+                            "     dns-nameservers $net.$self\n" .
+                            "     dns-search $domain\n");
+	$ifcfg_fh->close;
+
+	my $rslv = "/etc/resolv.conf";
+	open (my $RSLV, "> $rslv") or &logdie("cannot open '$rslv' for writing: $!");
+	printf $RSLV "search $domain\n";
+	printf $RSLV "nameserver $net.$self\n";
+	close $RSLV;
+
+	# ensure it's readable!
+	chmod 0644, $rslv;
+	if (system("service $network_service restart >/dev/null 2>&1")) {
+		&log ("cannot restart $network_service");
+	} else {
+		&log ("$network_service restarted successfully");
+	}
+}
+
+sub change_network_manager_settings {
+	my $self = $settings{'self-address'};
+	my $net = $settings{'net'};
+	my $gw = "$net.$settings{'gateway'}";
+	my $ip = "$net.$self";
+	my ($dns1, $dns2) = &resolve_dns_ips();
+	system("hda-change-network $ip $gw $dns1 $dns2");
+}
+
+sub print_dhcpd_conf {
+
+	my $net = $settings{'net'};
+	my $full_net = $net . "." . $settings{'net_start'};
+	my $gw = $net . "." . $settings{'gateway'};
+	my $self = $net . "." . $settings{'self-address'};
+	my $dns1 = $net . "." . $settings{'self-address'};
+	my $dyn_lo = $net . "." . $settings{'dyn_lo'};
+	my $dyn_hi = $net . "." . $settings{'dyn_hi'};
+	my $rev_net = &reverse_net ($net);
+	my $time_offset = &get_time_offset();
+
+	open(my $dhcpd, ">", $file_dhcpd);
+
+	printf $dhcpd "ddns-update-style interim;\n";
+	printf $dhcpd "do-forward-updates on;\n";
+	printf $dhcpd "allow unknown-clients;\n";
+	printf $dhcpd "ddns-updates on;\n";
+        printf $dhcpd "ddns-domainname \"%s\";\n", $settings{'domain'};
+        printf $dhcpd "ddns-rev-domainname \"in-addr.arpa\";\n";
+	printf $dhcpd "ignore client-updates;\n";
+	printf $dhcpd "allow bootp;\n";
+	printf $dhcpd "allow booting;\n";
+	printf $dhcpd "\n";
+	printf $dhcpd "subnet %s netmask %s {\n", $full_net, $settings{'netmask'};
+	printf $dhcpd "\tauthoritative;\n";
+	printf $dhcpd "\toption routers %s;\n", $gw;
+	printf $dhcpd "\toption subnet-mask %s;\n", $settings{'netmask'};
+	printf $dhcpd "\toption domain-name \"%s\";\n", $settings{'domain'};
+	if ($use_opendns_secondary) {
+		printf $dhcpd "\toption domain-name-servers %s, %s;\n", $dns1, "208.67.222.222";
+	} else {
+		printf $dhcpd "\toption domain-name-servers %s, %s;\n", $dns1, $dns1;
+	}
+	printf $dhcpd "\toption time-offset %s;\n", $time_offset;
+	printf $dhcpd "\trange %s %s;\n", $dyn_lo, $dyn_hi;
+	printf $dhcpd "\tdefault-lease-time %s;\n",$settings{'dhcp_lease_time'} || $default_dhcp_lease;
+	printf $dhcpd "\tmax-lease-time %s;\n",$settings{'dhcp_lease_time'} || $default_dhcp_lease;
+	printf $dhcpd "\tfilename \"pxelinux.0\";\n";
+	printf $dhcpd "\tnext-server %s;\n", $self;
+	printf $dhcpd "}\n\n";
+        printf $dhcpd "key \"ddnskey\" {\n";
+        printf $dhcpd "\talgorithm hmac-md5;\n";
+        printf $dhcpd "\tsecret \"%s\";\n", "8zaPJsiw9tOh2JFv4xiArw==";
+        printf $dhcpd "};\n\n";
+	printf $dhcpd "zone %s. {\n", $settings{'domain'};
+       	printf $dhcpd "\tprimary 127.0.0.1;\n";
+       	printf $dhcpd "\tkey ddnskey;\n";
+	printf $dhcpd "}\n\n";
+	printf $dhcpd "zone %s. {\n", $rev_net;
+       	printf $dhcpd "\tprimary 127.0.0.1;\n";
+       	printf $dhcpd "\tkey ddnskey;\n";
+	printf $dhcpd "}\n\n";
+
+	&print_dhcp_conf_hosts ($dhcpd);
+
+	close $dhcpd;
+
+	# move it in place
+	&mv ($file_dhcpd, "/etc/dhcp");
+}
+
+sub print_one_host_dnsmasq {
+	my $file = shift;
+	my $host = shift;
+	my $mac = shift;
+	my $address = shift;
+	my $domain = shift;
+	my $dhcp_lease_time = $settings{'dhcp_lease_time'} || $default_dhcp_lease;
+	my $ip = $settings{'net'} . "." . $address;
+	printf $file "dhcp-host=%s,%s,%s,%s\n", $mac, $ip, $host, $dhcp_lease_time;
+}
+
+sub print_static_dhcp_dnsmasq {
+	my $file = shift;
+
+	my $sth = $dbh->prepare("SELECT Name, MAC, Address FROM hosts order by Name");
+	$sth->execute();
+
+	my @row = ();
+	while (@row = $sth->fetchrow_array) {
+		&print_one_host_dnsmasq($file, $row[0], $row[1], $row[2], $settings {'domain'});
+	}
+	$sth->finish();
+}
+
+sub print_dnsmasq_common_conf {
+	return unless ($use_dnsmasq_dns || $use_dnsmasq_dhcp);
+
+	open(my $dnsmasq, ">", $file_dnsmasq_common);
+	printf $dnsmasq "# WARNING: Automatically generated by hda-ctl on " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n";
+	printf $dnsmasq "# Use /etc/hdactl.conf for defaults and add any customizations at the very end of /etc/dnsmasq.conf\n";
+	printf $dnsmasq "# common configuration\n";
+	printf $dnsmasq "no-resolv\n";
+	printf $dnsmasq "no-poll\n";
+	printf $dnsmasq "domain-needed\n";
+	printf $dnsmasq "bogus-priv\n";
+	printf $dnsmasq "expand-hosts\n";
+	printf $dnsmasq "localise-queries\n";
+	close $dnsmasq;
+
+	&mv ($file_dnsmasq_common, "/etc/dnsmasq.d/");
+}
+
+sub print_dnsmasq_dns_conf {
+	open(my $dnsmasq, ">", $file_dnsmasq_dns);
+
+	my $domain = $settings{'domain'};
+	my $net = $settings{'net'};
+	my $netmask = $settings{'netmask'};
+	my $dhcp_lease_time = $settings{'dhcp_lease_time'} || $default_dhcp_lease;
+	my $rev_net = &reverse_net($settings{'net'});
+	my $full_net = $net . ".0";
+	my $gw = $net . "." . $settings{'gateway'};
+	my $self = $net . "." . $settings{'self-address'};
+	my $dns1 = $self;
+	my $dyn_lo = $net . "." . $settings{'dyn_lo'};
+	my $dyn_hi = $net . "." . $settings{'dyn_hi'};
+	my $time_offset = &get_time_offset();
+	my ($extdns1, $extdns2) = &resolve_dns_ips();
+
+	printf $dnsmasq "# WARNING: Automatically generated by hda-ctl on " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n";
+	printf $dnsmasq "# Use /etc/hdactl.conf for defaults and add any customizations at the very end of /etc/dnsmasq.conf\n";
+	printf $dnsmasq "# DNS configuration\n";
+	if (&network_setting_enabled('dnsmasq_dns')) {
+		printf $dnsmasq "server=%s\n", $extdns1;
+		printf $dnsmasq "server=%s\n", $extdns2;
+		printf $dnsmasq "domain=%s\n", $domain;
+		# this did not work as expected for being authoritative for the local domain
+		# printf ($dnsmasq "local=\/%s\/%s\n", $domain, $self) unless $dnsmasq_query_local_upstream;
+		printf ($dnsmasq "address=\/%s\/%s\n", $domain, $self) if $dnsmasq_resolve_catch_all;
+		printf $dnsmasq "ptr-record=%s,hda.%s\n", &reverse_net($self), $domain;
+		&print_aliases_dnsmasq($dnsmasq);
+		&print_hosts_dnsmasq($dnsmasq);
+	} else {
+		printf $dnsmasq "# dnsmasq is not being used for DNS resolution\n";
+		printf $dnsmasq "port=0\n";
+	}
+
+	close $dnsmasq;
+
+	&mv ($file_dnsmasq_dns, "/etc/dnsmasq.d/");
+}
+
+sub print_dnsmasq_dhcp_conf {
+	open(my $dnsmasq, ">", $file_dnsmasq_dhcp);
+
+	my $domain = $settings{'domain'};
+	my $net = $settings{'net'};
+	my $netmask = $settings{'netmask'};
+	my $dhcp_lease_time = $settings{'dhcp_lease_time'} || $default_dhcp_lease;
+	my $rev_net = &reverse_net($settings{'net'});
+	my $full_net = $net . ".0";
+	my $gw = $net . "." . $settings{'gateway'};
+	my $self = $net . "." . $settings{'self-address'};
+	my $dns1 = $self;
+	my $dyn_lo = $net . "." . $settings{'dyn_lo'};
+	my $dyn_hi = $net . "." . $settings{'dyn_hi'};
+	my $time_offset = &get_time_offset();
+	my ($extdns1, $extdns2) = &resolve_dns_ips();
+
+	printf $dnsmasq "# WARNING: Automatically generated by hda-ctl on " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n";
+	printf $dnsmasq "# Use /etc/hdactl.conf for defaults and add any customizations at the very end of /etc/dnsmasq.conf\n";
+	printf $dnsmasq "# DHCP configuration\n";
+	if (&network_setting_enabled('dnsmasq_dhcp')) {
+		printf $dnsmasq "dhcp-authoritative\n";
+		printf $dnsmasq "dhcp-range=%s,%s,%s,%s\n", $dyn_lo, $dyn_hi, $netmask, $dhcp_lease_time;
+		printf $dnsmasq "dhcp-option=option:netmask,%s\n", $netmask;
+		printf $dnsmasq "dhcp-option=option:time-offset,%s\n", $time_offset;
+		printf $dnsmasq "dhcp-option=option:router,%s\n", $gw;
+		if ($use_opendns_secondary) {
+			printf $dnsmasq "dhcp-option=option:dns-server,%s,%s,%s\n", $dns1, $extdns1, $extdns2;
+		} else {
+			printf $dnsmasq "dhcp-option=option:dns-server,%s,%s\n", $dns1, $dns1;
+		}
+
+		# FEATURE: do not mess with tftp for now
+		# printf $dnsmasq "dhcp-option=option:tftp-server,\"%s\"\n", $self;
+		# printf $dnsmasq "dhcp-option=option:bootfile-name,\"pxelinux.0\"\n";
+
+		&print_static_dhcp_dnsmasq ($dnsmasq);
+	} else {
+		printf $dnsmasq "# dnsmasq dns not enabled\n";
+	}
+	close $dnsmasq;
+
+	&mv ($file_dnsmasq_dhcp, "/etc/dnsmasq.d/");
+}
+
+sub print_hosts_dnsmasq {
+	my $file = shift;
+
+	my $sth = $dbh->prepare("SELECT Name, Address FROM hosts order by Name");
+	$sth->execute();
+
+	my @row = ();
+	while (@row = $sth->fetchrow_array) {
+		my $host = $row[0];
+		my $ip = $settings{'net'} . "." . $row[1];
+		my $host_fqdn = $host . "." . $settings{'domain'};
+		printf $file "address=\/%s\/%s\/%s\n", $host, $host_fqdn, $ip;
+	}
+	$sth->finish();
+}
+
+sub print_aliases_dnsmasq {
+	my $file = shift;
+
+	my $sth = $dbh->prepare("SELECT name, address FROM dns_aliases");
+	$sth->execute();
+
+	my @row = ();
+	while (@row = $sth->fetchrow_array) {
+		my $alias = $row[0];
+		my $alias_fqdn = $alias . "." . $settings{'domain'};
+		# address can be of three forms:
+		# '' -> the alias maps to the self-address ip
+		# '<int>' -> the alias maps to the 1-255 address
+		# 'some.full.ip.address' -> the alias maps to that address
+		my $address = $row[1];
+		# if empty, point to the self-address host
+		if ($address =~ /^\s*$/) {
+			my $default_alias_ip = $settings{'net'} . "." . $settings{'self-address'};
+			printf $file "address=\/%s\/%s\/%s\n", $alias, $alias_fqdn, $default_alias_ip;
+		} else {
+			# if it has just an bunch of digits check if it's a simple ip
+			if ($address =~ /^\s*\d+\s*$/) {
+				my $ip = int($address);
+				if (($ip > 0) && ($ip < 255)) {
+					my $full_ip = $settings{'net'} . "." . $ip;
+					printf $file "ptr-record=%s,%s\n", &reverse_net($full_ip), $alias_fqdn;
+					printf $file "address=\/%s\/%s\/%s\n", $alias, $alias_fqdn, $full_ip;
+				} else {
+					&log ("skipping alias '$alias' for address '$address' (too large)")
+				}
+			} else {
+				# else check if it's in the form of an address
+				if ($address =~ /^\s*\d+\.\d+\.\d+\.\d+\s*$/) {
+					# FIXME: this should have some more checking.
+					printf $file "ptr-record=%s,%s\n", &reverse_net($address), $alias_fqdn;
+					printf $file "address=\/%s\/%s\/%s\n", $alias, $alias_fqdn, $address;
+				} else {
+					# else assume is a cname - needs error checking
+					# FIXME - this has the potential to generate bad config files. so it's disabled.
+					# printf $file "cname=%s,%s\n", $alias, $address
+					&log ("skipping alias '$alias' for address '$address' (the latter does not parse as an ip address)");
+
+				}
+			}
+		}
+	}
+	$sth->finish();
+}
+
+sub print_dnsmasq_ipv6_conf {
+	return unless ($use_dnsmasq_dns || $use_dnsmasq_dhcp);
+
+	open(my $dnsmasq, ">", $file_dnsmasq_ipv6);
+	printf $dnsmasq "# WARNING: Automatically generated by hda-ctl on " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n";
+	printf $dnsmasq "# basic ipv6 support configuration; add a line with log-dhcp for details/debug\n";
+	printf $dnsmasq "enable-ra\n";
+	printf $dnsmasq "dhcp-option=option6:dns-server,[::]\n";
+	printf $dnsmasq "dhcp-range=::,ra-stateless\n";
+	close $dnsmasq;
+
+	&mv ($file_dnsmasq_ipv6, "/etc/dnsmasq.d/");
+}
+
+sub generate_dhcp_settings {
+	if ($use_dnsmasq_dhcp) {
+		&print_dnsmasq_dhcp_conf();
+		#&print_dnsmasq_ipv6_conf();
+	} else {
+		&print_dhcpd_conf();
+	}
+}
+
+sub generate_dns_settings {
+	if ($use_dnsmasq_dns) {
+		&print_dnsmasq_dns_conf();
+	} else {
+		&get_named_settings();
+		&print_named_conf ();
+		&print_zone_files ();
+	}
+}
+
+sub generate_files {
+
+	&get_db_settings();
+	#&print_dnsmasq_common_conf() if ($dnsmasq_in_use);
+	&generate_dhcp_settings();
+	&generate_dns_settings();
+	&change_network_manager_settings ();
+	&print_resolver ();
+}
+
+sub basic_checks {
+	my $ruid = $<;
+	my $euid = $>;
+
+	if ($euid != 0) {
+		printf "ERROR: this program must be run as \"root\".\n";
+		printf "Quitting ...\n";
+		exit (1);
+	}
+	if (-e $pidfile) {
+		printf "ERROR: this program appears to be running.\n";
+		printf "Quitting ...\n";
+		exit (1);
+	}
+	$platform = &get_platform();
+	&log ("running on platform: $platform");
+}
+
+sub get_platform {
+
+
+        if (open (my $file, "< /etc/amahi-release")) {
+		my $p = <$file>;
+	        chomp $p;
+	        return "fedora" if ($p =~ /Fedora/);
+	        return "debian" if ($p =~ /Debian/);
+	        return "ubuntu" if ($p =~ /Ubuntu/);
+	}
+
+	open (my $file, "< /etc/system-release") or return "unknown";
+	my $p = <$file>;
+	chomp $p;
+	return "fedora" if ($p =~ /Fedora/);
+	return "debian" if ($p =~ /Debian/);
+	return "ubuntu" if ($p =~ /Ubuntu/);
+
+	return "unknown";
+}
+
+### detach ourselves as a daemon
+
+sub fork_daemon {
+
+	my $pid = fork;
+	if ($pid < 0) {
+		print STDERR "${program}: can not fork ($!)\n";
+		exit -1;
+	} elsif ($pid) {
+		# parent simply exit
+		exit 0;
+	}
+	# chil continues execution
+	$SIG{'CHLD'}   = 'DEFAULT';
+	open(STDOUT, ">/dev/null");
+	open(STDERR, ">/dev/null");
+	open(STDIN,  "</dev/null");
+	mkdir("/var/run/hda-ctl");
+
+	&write_pid ();
+}
+
+sub unlink_files {
+	unlink $pidfile;
+}
+
+sub write_pid {
+
+	return unless ($pidfile);
+	local *FD;
+	if (! open(FD, "> $pidfile")) {
+		&log ("Cannot create file '$pidfile'. ($!)");
+	} else {
+		printf FD "$$\n";
+		close(FD);
+	}
+}
+
+sub do_action {
+	my $action = shift;
+	my $api_key = $settings{'api-key'};
+	my $os = &get_os_version();
+	my $arch = &get_arch();
+	my $url = "https://api-ddns.amahi.org/api2/$action?api_key=$api_key&os=$os&arch=$arch&ver=$version";
+	my $ua = LWP::UserAgent->new;
+        my $response = $ua->put($url);
+        if (!$response->is_success) {
+                &log("amahi.org action '$action' failed with '$response->status_line'");
+        }
+}
+
+sub do_periodic_update {
+	&do_action("update");
+}
+
+sub do_start_action {
+	&do_action("start");
+}
+
+sub do_shutdown_action {
+	&do_action("stop");
+}
+
+sub do_periodic_action {
+	&do_periodic_update();
+}
+
+sub network_setting_enabled {
+	my $setting = shift;
+
+	my $sth = $dbh->prepare("SELECT value from settings WHERE name = ?; ")
+		or &logdie("Couldn't prepare statement: " . $dbh->errstr);
+	$sth->execute($setting);
+	my @data = $sth->fetchrow_array();
+
+	# default to enabled
+	my $result = 1;
+	if (@data) {
+		$result = ($data[0] == 1);
+		if ($result) {
+			&log ("$setting is enabled")
+		} else {
+			&log ("$setting is disabled")
+		}
+	} else {
+		&log ("network setting '$setting' is not present")
+	}
+	return $result;
+}
+
+sub should_run_at_boot {
+	my $service = shift;
+
+	my $sth = $dbh->prepare('SELECT start_at_boot from `servers` WHERE `name` = ?; ')
+		or &logdie("Couldn't prepare statement: " . $dbh->errstr);
+	$sth->execute($service);
+	my @data = $sth->fetchrow_array();
+
+	my $result = 1;
+	if (@data) {
+		$result = ($data[0] == 1);
+		if ($result) {
+			&log ("$service is enabled")
+		} else {
+			&log ("$service is disabled")
+		}
+	} else {
+		# default to enabled, cause the service is not there!
+		$result = 1;
+		&log ("$service setting is not present - defaulting to enabled")
+	}
+	return $result;
+}
+
+sub restart_named {
+	if (&should_run_at_boot($named_service)) {
+		if (system("systemctl restart $named_service.service >/dev/null 2>&1")) {
+			&log ("cannot restart $named_service");
+		} else {
+			&log ("$named_service restarted successfully");
+		}
+	} else {
+		&log("named not enabled");
+	}
+}
+
+sub restart_dnsmasq {
+	my $cmd = "";
+	if (&should_run_at_boot("dnsmasq")) {
+		if ($platform eq "fedora") {
+			$cmd = "systemctl restart dnsmasq.service >& /dev/null";
+		} else {
+			$cmd = "service dnsmasq restart >/dev/null 2>&1";
+		}
+
+		if (system($cmd)) {
+			&log ("cannot restart dnsmasq");
+		} else {
+			&log ("dnsmasq restarted successfully");
+		}
+	} else {
+		&log("dnsmasq not enabled");
+	}
+}
+
+sub restart_network {
+
+	my $g = get("http://www.yahoo.com");
+	if (!defined($g)) {
+		if (system("service $network_service restart >/dev/null 2>&1")) {
+			&log ("cannot restart $network_service");
+		} else {
+			&log ("$network_service restarted successfully");
+		}
+	}
+}
+
+sub get_os_version {
+	if (open (my $file, "< /etc/amahi-release")) {
+		my $f = <$file>;
+		chomp $f;
+		return uri_escape($f);
+	}
+	if (open (my $file, "< /etc/system-release")) {
+		my $f = <$file>;
+		chomp $f;
+		return uri_escape($f);
+	}
+	if (open (my $file, "< /etc/issue")) {
+		my $f = <$file>;
+		chomp $f;
+		return uri_escape($f);
+	}
+	return uri_escape("no-sys-release-file");
+}
+
+sub get_arch {
+	if ($platform eq "fedora") {
+		open (my $file, "uname -i |") or
+			return uri_escape("cannot-run-uname-i");
+		my $f = <$file>;
+		chomp $f;
+		return uri_escape($f);
+	} else {
+		open (my $file, "uname -m |") or
+			return uri_escape("cannot-run-uname-m");
+		my $f = <$file>;
+		chomp $f;
+		return uri_escape($f);
+	}
+}
+
+sub restart_dhcpd {
+	if(&should_run_at_boot($dhcp_service)){
+		if (system("systemctl stop $dhcp_service.service >/dev/null 2>&1")) {
+			&log ("cannot stop $dhcp_service");
+		} else {
+			&log ("$dhcp_service stopped successfully");
+		}
+
+		if (system("systemctl start $dhcp_service.service >/dev/null 2>&1")) {
+			&log ("cannot start $dhcp_service");
+		} else {
+			&log ("$dhcp_service started successfully");
+		}
+	} else {
+		&log("$dhcp_service not enabled");
+	}
+}
+
+sub do_hup_action {
+	&log ("caught SIGHUP: executing programmed action.");
+
+	&db_connect();
+    &generate_files ();
+	#&restart_named () unless $use_dnsmasq_dns;
+	#&restart_dhcpd () unless $use_dnsmasq_dhcp;
+	#&restart_dnsmasq () if $dnsmasq_in_use;
+	&db_disconnect ();
+	&log ("services restarted");
+}
+
+sub dump_mode {
+	$dump_mode = 1;
+	&db_connect();
+	&generate_files ();
+	&db_disconnect();
+	exit (0);
+}
+
+sub command_fifo_old {
+	unless (-p $cmdfile) {
+		unlink $cmdfile;
+		my $prev_umask = umask 000;
+		if (! mkfifo($cmdfile, 0666)) {
+			&log("can’t mkfifo $cmdfile: $!");
+			return -1;
+		}
+		umask $prev_umask;
+	}
+
+	while (1) {
+		if (! open($CMDFIFO, "<", $cmdfile)) {
+			last;
+		}
+		$CMDFIFO->autoflush(1);
+		while (<$CMDFIFO>) {
+			chomp;
+			my $cmd = $_;
+			# FIXME!!! - check that commands being run are valid!
+			my $ret = system($cmd);
+		}
+		close ($CMDFIFO);
+	}
+	unlink $cmdfile;
+	return 0;
+}
+
+sub command_fifo {
+
+	if (! socket(SERV, PF_UNIX, SOCK_STREAM, 0)) {
+		&log("can’t setup socket for $cmdfile: $!");
+	}
+
+	unlink $cmdfile;
+	my $prev_umask = umask 000;
+	if (! bind(SERV, sockaddr_un($cmdfile))) {
+		&log("can’t bind with $cmdfile: $!");
+		return -1;
+	}
+	umask $prev_umask;
+
+	if (! listen(SERV, SOMAXCONN)) {
+		&log("can’t listen on $cmdfile: $!");
+		return -1;
+	}
+
+	&log("command fifo starting ...");
+	while (!$caught_term) {
+		# serve one at a time
+		while (accept(CLIENT, SERV)) {
+			CLIENT->autoflush(1);
+			while (<CLIENT>) {
+				if (/confirm: (.*)$/) {
+					# write ack back if found
+					print CLIENT $1;
+					last;
+				}
+				chomp;
+				my $cmd = $_;
+				# FIXME!!! - check that commands being run are valid!
+				my $ret = system($cmd);
+			}
+			close (CLIENT);
+		}
+		&log("WARNING: accept failed with: $!") unless $caught_term;
+	}
+	&log("caught SIGTERM: command fifo terminating.");
+	unlink $cmdfile;
+	return 0;
+}
+
+sub fork_command_fifo {
+
+	my $pid = fork;
+	if ($pid < 0) {
+		print STDERR "${program}: can not fork ($!)\n";
+		exit -1;
+	} elsif ($pid) {
+		# parent
+		return $pid;
+	}
+
+	# this is the child process
+	my $ret = &command_fifo();
+	exit $ret;
+	# if we return, it would go back to the parent process to
+	# start the daemon!
+}
+
+sub usage {
+	printf "usage: hda-ctl [-d]\n";
+	printf "\t-d: dump files in current directory and exit\n";
+
+	exit (0);
+}
+
+sub get_time_offset {
+	my $wasnegative = 0;
+
+	open TIME, "date +%z |" or &logdie("Failed to open pipe in get_time_offset: $!");
+	my $time = <TIME>;
+	close TIME;
+
+	if ($time < 0){
+		$wasnegative = 1;
+		$time *= -1;
+	}
+	$time =~ s/0//g;
+
+	my $timeoffset = $time * 3600;
+
+	if ($wasnegative){
+		$timeoffset *= -1;
+	}
+
+	return $timeoffset;
+}
+
+sub get_current_ip {
+        my $dhclient_lease = '/var/lib/dhclient/dhclient.leases';
+        my $string_to_search = 'option routers';
+
+        #removing old dhclient config
+        system("rm -f /var/lib/NetworkManager/dhclient* /var/lib/dhclient/dhclient* ");
+        #killing dhclient
+        system("killall dhclient && sleep 5");
+        #Starting dhclient
+        system("dhclient");
+
+        #opening the file
+        open my $fh, '<', $dhclient_lease or die "Can't open file : $!";
+        #reading each line
+        while(my $line = <$fh>){
+              # Delete newline
+              chomp($line);
+              if (index($line, $string_to_search) != -1) {
+                                 #check line for IP ADDRESS
+                                 if ($line =~ /$RE{net}{IPv4}{-keep}/){
+                                                     close $fh or die "Couldn't Close File : $!";
+                                                     return $1;
+                                                  }
+
+              }
+        }
+        close $fh or die "Couldn't Close File : $!";
+        return "";
+}
+
+sub update_router_ip {
+        my $api_key = $settings{'api-key'};
+        my $net = $settings{'net'};
+        my $gateway = $settings{'gateway'};
+        my $ua = LWP::UserAgent->new;
+        my $api_url = "https://api.amahi.org/api2/router_update";
+        my $response = $ua->post( $api_url, ['api_key' => $api_key , 'net'=> $net, 'gw' => $gateway ] );
+        if (!$response->is_success) {
+                     &log("amahi.org router ip update failed with '$response->status_line'");
+        }
+ 
+}
+sub set_platform_variables {
+	if ($platform eq "fedora") {
+		$named_user = "named";
+		$named_service = "named";
+		$named_dir = "/etc";
+		$network_service = "network";
+		$dhcp_service = "dhcpd";
+	} else {
+		$named_user = "bind";
+		$named_service = "bind9";
+		$named_dir = "/etc/bind";
+		$network_service = "networking";
+		$dhcp_service = "isc-dhcp-server";
+	}
+}
+
+sub main {
+
+	&usage() if (defined($opt_h));
+
+        # first set platform and platform variables, these are needed by dump_mode
+        $platform = &get_platform();
+        &log ("running on platform: $platform");
+        &set_platform_variables();
+
+        #another REBOOT required for GW change, if GW got changed
+        if (-e '/etc/reboot_now_gw_change') {
+        system("rm /etc/reboot_now_gw_change");
+	#for update to amahi.org later
+        system("touch /etc/amahi_org_update");
+        system("reboot"); 
+        }     
+
+	# dump mode exits after it's done
+	&dump_mode() if (defined($opt_d));
+
+	&log ("starting hda-ctl v$version.");
+
+	&basic_checks ();
+
+	&fork_daemon ();
+	my $command_processor_pid = &fork_command_fifo ();
+
+	# FIXME - this will reset the settings from the DB at
+	# every reboot
+	&db_connect ();
+
+	#&restart_named () unless ($use_dnsmasq_dns);
+	#&restart_dhcpd () unless ($use_dnsmasq_dhcp);
+	#&restart_dnsmasq () if $dnsmasq_in_use;
+
+	&generate_files ();
+
+        #getting GW from DHCLIENT
+        my $gw_address = &get_current_ip();
+
+        #update router IP in amahi.org after 2 reboots
+        if (-e '/etc/amahi_org_update') {
+        system("rm /etc/amahi_org_update");
+        &update_router_ip();
+        } 
+
+        #if DHCLIENT GW not equal to SQL gateway, change it to GW 
+        if($gw_address && $gw_address ne "$settings{'net'}.$settings{'gateway'}") {
+        system("hda-change-gw $gw_address");  
+        system("sleep 3");
+        #for doing another reboot and then updating router IP to amahi.org
+        system("touch /etc/reboot_now_gw_change /etc/amahi_org_update");
+        system("reboot");       
+        }
+        
+        &db_disconnect ();
+
+	&do_start_action();
+
+	umask 022;
+	do {
+		$now = time;
+
+		my $left = $period;
+		while (($left > 0) && !$caught_hup && !$caught_term && !$caught_usr1) {
+			my $delay = $left > 5 ? 5 : $left;
+
+			$0 = sprintf("%s - sleeping for %s seconds", $program, $left);
+			$left -= sleep $delay;
+		}
+
+		&do_periodic_action();
+
+		unless ($caught_term) {
+			if ($caught_hup) {
+				&do_hup_action ();
+				$caught_hup = 0;
+			}
+		}
+
+	} while (!$caught_term);
+
+	&log ("caught SIGTERM: exiting hda-ctl v$version.") if $caught_term;
+	&do_shutdown_action();
+	&unlink_files();
+	kill('TERM', $command_processor_pid);
+
+	# exit normally
+	exit 0;
+}
+
+&main ();
+
