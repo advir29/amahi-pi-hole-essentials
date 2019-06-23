@@ -1203,22 +1203,22 @@ sub restart_named {
 	}
 }
 
-sub restart_dnsmasq {
+sub restart_pihole {
 	my $cmd = "";
-	if (&should_run_at_boot("dnsmasq")) {
+	if (&should_run_at_boot("pihole-FTL")) {
 		if ($platform eq "fedora") {
-			$cmd = "systemctl restart dnsmasq.service >& /dev/null";
+			$cmd = "systemctl restart pihole-FTL.service >& /dev/null";
 		} else {
-			$cmd = "service dnsmasq restart >/dev/null 2>&1";
+			$cmd = "service pihole-FTL restart >/dev/null 2>&1";
 		}
 
 		if (system($cmd)) {
-			&log ("cannot restart dnsmasq");
+			&log ("cannot restart pihole");
 		} else {
-			&log ("dnsmasq restarted successfully");
+			&log ("pihole restarted successfully");
 		}
 	} else {
-		&log("dnsmasq not enabled");
+		&log("pihole not enabled");
 	}
 }
 
@@ -1294,7 +1294,7 @@ sub do_hup_action {
     &generate_files ();
 	#&restart_named () unless $use_dnsmasq_dns;
 	#&restart_dhcpd () unless $use_dnsmasq_dhcp;
-	#&restart_dnsmasq () if $dnsmasq_in_use;
+	&restart_pihole () if $dnsmasq_in_use;
 	&db_disconnect ();
 	&log ("services restarted");
 }
@@ -1517,7 +1517,7 @@ sub main {
 
 	#&restart_named () unless ($use_dnsmasq_dns);
 	#&restart_dhcpd () unless ($use_dnsmasq_dhcp);
-	#&restart_dnsmasq () if $dnsmasq_in_use;
+	&restart_pihole () if $dnsmasq_in_use;
 
 	&generate_files ();
 
