@@ -1011,7 +1011,7 @@ sub print_dnsmasq_ipv6_conf {
 
 sub generate_dhcp_settings {
 	if ($use_dnsmasq_dhcp) {
-		&print_dnsmasq_dhcp_conf();
+		#&print_dnsmasq_dhcp_conf();
 		#&print_dnsmasq_ipv6_conf();
 	} else {
 		&print_dhcpd_conf();
