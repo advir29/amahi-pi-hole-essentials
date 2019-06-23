@@ -1032,7 +1032,7 @@ sub generate_files {
 
 	&get_db_settings();
 	#&print_dnsmasq_common_conf() if ($dnsmasq_in_use);
-	&generate_dhcp_settings();
+	#&generate_dhcp_settings();
 	&generate_dns_settings();
 	&change_network_manager_settings ();
 	&print_resolver ();
