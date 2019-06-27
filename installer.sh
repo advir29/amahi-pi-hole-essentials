@@ -1,4 +1,4 @@
-wget https://raw.githubusercontent.com/advir29/amahi-pi-hole-essentials/master/hda-ctl
+wget https://raw.githubusercontent.com/advir29/amahi-pi-hole-essentials/setupVars_integrated/hda-ctl
 wget https://raw.githubusercontent.com/advir29/amahi-pi-hole/master/automated%20install/basic-install.sh
 chmod 755 basic-install.sh
 mkdir -p /etc/pihole/

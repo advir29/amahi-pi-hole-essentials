@@ -1079,7 +1079,7 @@ sub generate_dns_settings {
 sub generate_files {
 
 	&get_db_settings();
-	if(-d "/etc/pihole"){
+	if($settings{'pihole_enabled'}){
 		&print_setupVars();
 		&enable_pihole_dhcp();
 	}else{
