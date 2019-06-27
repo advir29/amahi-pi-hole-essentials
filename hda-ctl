@@ -1370,7 +1370,7 @@ sub do_hup_action {
 	if(-e '/etc/dnsmasq.d/01-pihole.conf'){
 		&restart_pihole ();
 	}else{
-		&&restart_dnsmasq () if $dnsmasq_in_use;
+		&restart_dnsmasq () if $dnsmasq_in_use;
 	}
 	&db_disconnect ();
 	&log ("services restarted");
@@ -1597,7 +1597,7 @@ sub main {
 	if(-e '/etc/dnsmasq.d/01-pihole.conf'){
 		&restart_pihole ();
 	}else{
-		&&restart_dnsmasq () if $dnsmasq_in_use;
+		&restart_dnsmasq () if $dnsmasq_in_use;
 	}
 	&generate_files ();
     #getting GW from DHCLIENT
