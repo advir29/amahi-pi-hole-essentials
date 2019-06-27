@@ -1081,7 +1081,9 @@ sub generate_files {
 	&get_db_settings();
 	if($settings{'pihole_enabled'}){
 		&print_setupVars();
-		&enable_pihole_dhcp();
+		if(-e "/etc/dnsmasq.d/01-pihole.conf"){
+			&enable_pihole_dhcp();
+		}
 	}else{
 		&print_dnsmasq_common_conf() if ($dnsmasq_in_use);
 		&generate_dhcp_settings();
