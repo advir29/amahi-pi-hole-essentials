@@ -1083,10 +1083,14 @@ sub generate_files {
 		&print_setupVars();
 		if(-e "/etc/dnsmasq.d/01-pihole.conf"){
 			&enable_pihole_dhcp();
+		}else{
+			&print_dnsmasq_common_conf() if ($dnsmasq_in_use);
+			&generate_dhcp_settings();
 		}
+	}else{
+		&print_dnsmasq_common_conf() if ($dnsmasq_in_use);
+		&generate_dhcp_settings();
 	}
-	&print_dnsmasq_common_conf() if ($dnsmasq_in_use);
-	&generate_dhcp_settings();
 	&generate_dns_settings();
 	&change_network_manager_settings ();
 	&print_resolver ();
