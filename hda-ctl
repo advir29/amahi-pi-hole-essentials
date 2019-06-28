@@ -1084,11 +1084,9 @@ sub generate_files {
 		if(-e "/etc/dnsmasq.d/01-pihole.conf"){
 			&enable_pihole_dhcp();
 		}
-	}else{
-		&print_dnsmasq_common_conf() if ($dnsmasq_in_use);
-		&generate_dhcp_settings();
 	}
-	&enable_pihole_dhcp();
+	&print_dnsmasq_common_conf() if ($dnsmasq_in_use);
+	&generate_dhcp_settings();
 	&generate_dns_settings();
 	&change_network_manager_settings ();
 	&print_resolver ();
