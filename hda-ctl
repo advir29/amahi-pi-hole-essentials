@@ -1079,8 +1079,10 @@ sub generate_dns_settings {
 sub generate_files {
 
 	&get_db_settings();
+	#if pihole directory is present generate setupVars.conf required by pihole to work properly
 	if(-d "/etc/pihole"){
 		&print_setupVars();
+		#during pihole install if hda-ctl restarts it should not generate pihole_dhcp file. Only when pihole install is complete generate these files. 
 		if(-e "/etc/dnsmasq.d/01-pihole.conf"){
 			&enable_pihole_dhcp();
 		}else{
