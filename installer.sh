@@ -8,5 +8,4 @@ chmod --reference=/usr/bin/hda-ctl.orig /usr/bin/hda-ctl
 systemctl restart hda-ctl
 sed -i '/DocumentRoot/c\        DocumentRoot /var/hda/web-apps/pihole/html/admin' /etc/httpd/conf.d/*pihole.conf
 sed -i '/<Directory/c\        <Directory "/var/hda/web-apps/pihole/html/admin">' /etc/httpd/conf.d/*pihole.conf
-rm /etc/dnsmasq.d/amahi*
 ./basic-install.sh -d /var/hda/web-apps/pihole &
