@@ -926,6 +926,13 @@ sub print_dnsmasq_dhcp_conf {
 		# printf $dnsmasq "dhcp-option=option:bootfile-name,\"pxelinux.0\"\n";
 
 		&print_static_dhcp_dnsmasq ($dnsmasq);
+		
+		#to display dhcp leases on dashboard
+		if ( -e "/etc/pihole/dhcp.leases") {
+			system ("rm /var/lib/dnsmasq/dnsmasq.leases");
+			system ("cp /etc/pihole/dhcp.leases /var/lib/dnsmasq/dnsmasq.leases");
+		}
+
 	} else {
 		printf $dnsmasq "# dnsmasq dns not enabled\n";
 	}
