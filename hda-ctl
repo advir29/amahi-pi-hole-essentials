@@ -917,7 +917,7 @@ sub print_dnsmasq_dhcp_conf {
 		} else {
 			printf $dnsmasq "dhcp-option=option:dns-server,%s,%s\n", $dns1, $dns1;
 		}
-		if ( -e "/etc/dnsmasq/01-pihole.conf") {
+		if ( -e "/etc/dnsmasq.d/01-pihole.conf") {
 			printf $dnsmasq "dhcp-leasefile=/etc/pihole/dhcp.leases\n";
 		}
 
@@ -1065,7 +1065,7 @@ sub generate_dns_settings {
 }
 
 sub generate_files {
-
+	
 	&get_db_settings();
 	if ( -d "/etc/pihole") {
 		&print_setupVars();
